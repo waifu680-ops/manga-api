@@ -1,8 +1,9 @@
 import os
 import io
 import time
+import json
 import requests
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
 
 app = Flask(__name__)
@@ -10,23 +11,17 @@ app = Flask(__name__)
 FONT_PATH = "manga-font.ttf"
 
 def get_optimal_font_and_wrap(text, font_path, max_width, max_height, draw):
-    """
-    Dinamik font boyutu ve metin kırma (word-wrap) hesaplayıcısı.
-    Balonun genişliğine ve yüksekliğine en uygun font boyutunu bulur.
-    """
-    min_font_size = 11  # Okunabilirlik için alt sınır
-    max_font_size = 40  # Çok devasa olmaması için üst sınır
+    min_font_size = 11
+    max_font_size = 40
     optimal_font_size = min_font_size
     optimal_wrapped_text = text
 
-    # Büyük fonttan küçüğe doğru dene
     for size in range(max_font_size, min_font_size - 1, -1):
         try:
             font = ImageFont.truetype(font_path, size)
         except:
             font = ImageFont.load_default()
 
-        # Metni bu font boyutuyla kırp
         words = text.split()
         lines = []
         current_line = ""
@@ -35,35 +30,25 @@ def get_optimal_font_and_wrap(text, font_path, max_width, max_height, draw):
             if draw.textlength(test_line, font=font) <= max_width:
                 current_line = test_line
             else:
-                if current_line:
-                    lines.append(current_line.strip())
+                if current_line: lines.append(current_line.strip())
                 current_line = word + " "
-        if current_line:
-            lines.append(current_line.strip())
+        if current_line: lines.append(current_line.strip())
         
         wrapped_text = "\n".join(lines)
-        
-        # Kırpılmış metnin toplam sınırlarını hesapla
         left, top, right, bottom = draw.multiline_textbbox((0, 0), wrapped_text, font=font)
         text_w = right - left
         text_h = bottom - top
         
-        # Eğer hesaplanan boyutlar balonun içine sığıyorsa, en iyi boyutu bulduk!
         if text_w <= max_width and text_h <= max_height:
             optimal_font_size = size
             optimal_wrapped_text = wrapped_text
             break
-    
-    # En iyi fontu yükle ve döndür
-    try:
-        final_font = ImageFont.truetype(font_path, optimal_font_size)
-    except:
-        final_font = ImageFont.load_default()
-        
+            
+    try: final_font = ImageFont.truetype(font_path, optimal_font_size)
+    except: final_font = ImageFont.load_default()
     return final_font, optimal_wrapped_text
 
 def merge_boxes(boxes, margin=45):
-    """Birbirine yakın olan Azure satırlarını tek bir 'Konuşma Balonu' olarak birleştirir."""
     if not boxes: return []
     boxes = sorted(boxes, key=lambda x: x['top'])
     merged = []
@@ -75,7 +60,7 @@ def merge_boxes(boxes, margin=45):
         v_close = (box['top'] - last['bottom']) < margin
         h_overlap = not (box['left'] > last['right'] or box['right'] < last['left'])
         if v_close and h_overlap:
-            last['text'] += " " + box['text']
+            last['original_text'] += " " + box['original_text']
             last['left'] = min(last['left'], box['left'])
             last['top'] = min(last['top'], box['top'])
             last['right'] = max(last['right'], box['right'])
@@ -84,10 +69,12 @@ def merge_boxes(boxes, margin=45):
             merged.append(box)
     return merged
 
-@app.route('/process-manga', methods=['POST'])
-def process_manga():
-    if 'image' not in request.files:
-        return {"error": "Görsel eksik."}, 400
+# ==========================================
+# ROTA 1: ANALİZ ET (OCR + ÇEVİRİ) -> VERİ DÖNDÜR
+# ==========================================
+@app.route('/analyze-manga', methods=['POST'])
+def analyze_manga():
+    if 'image' not in request.files: return {"error": "Görsel eksik."}, 400
 
     image_file = request.files['image']
     azure_endpoint = request.form.get('azure_endpoint')
@@ -95,19 +82,16 @@ def process_manga():
     deepl_key = request.form.get('deepl_key')
 
     if not azure_endpoint or not azure_key or not deepl_key:
-        return {"error": "Azure veya DeepL API anahtarları eksik!"}, 400
+        return {"error": "API anahtarları eksik!"}, 400
 
-    try:
-        img = Image.open(image_file).convert("RGB")
-    except Exception as e:
-        return {"error": f"Görsel bozuk: {str(e)}"}, 400
+    try: img = Image.open(image_file).convert("RGB")
+    except Exception as e: return {"error": f"Görsel bozuk: {str(e)}"}, 400
     
-    draw = ImageDraw.Draw(img)
-
     img_io = io.BytesIO()
     img.save(img_io, format='JPEG', quality=95)
     img_bytes = img_io.getvalue()
 
+    # AZURE OCR
     endpoint_url = azure_endpoint.rstrip('/') + "/vision/v3.2/read/analyze"
     headers = {'Ocp-Apim-Subscription-Key': azure_key, 'Content-Type': 'application/octet-stream'}
     
@@ -116,64 +100,84 @@ def process_manga():
         analyze_resp.raise_for_status()
         operation_url = analyze_resp.headers["Operation-Location"]
         
-        poll_headers = {'Ocp-Apim-Subscription-Key': azure_key}
         status = ""
         while status not in ["succeeded", "failed"]:
             time.sleep(1)
-            poll_resp = requests.get(operation_url, headers=poll_headers)
+            poll_resp = requests.get(operation_url, headers={'Ocp-Apim-Subscription-Key': azure_key})
             poll_data = poll_resp.json()
             status = poll_data.get("status")
         
-        if status == "failed":
-            return {"error": "Azure OCR işlemi başarısız oldu."}, 400
+        if status == "failed": return {"error": "Azure işlemi başarısız."}, 400
+    except Exception as e: return {"error": f"Azure API Hatası: {str(e)}"}, 500
 
-    except Exception as e:
-        return {"error": f"Azure API Hatası: {str(e)}"}, 500
-
-    analyze_result = poll_data.get("analyzeResult", {}).get("readResults", [])
-    if not analyze_result:
-        return {"error": "Azure sonuç döndürmedi."}, 400
-
-    lines = analyze_result[0].get("lines", [])
-    if not lines:
-        return {"error": "Görselde metin bulunamadı."}, 400
+    lines = poll_data.get("analyzeResult", {}).get("readResults", [])[0].get("lines", [])
+    if not lines: return {"error": "Görselde metin bulunamadı."}, 400
 
     raw_boxes = []
     for line in lines:
         text = line.get("text", "")
         box = line.get("boundingBox", []) 
         if not text or len(box) != 8: continue
-            
         l = min(box[0], box[2], box[4], box[6])
         t = min(box[1], box[3], box[5], box[7])
         r = max(box[0], box[2], box[4], box[6])
         b = max(box[1], box[3], box[5], box[7])
-        raw_boxes.append({'text': text, 'left': l, 'top': t, 'right': r, 'bottom': b})
+        raw_boxes.append({'original_text': text, 'left': l, 'top': t, 'right': r, 'bottom': b})
 
     bubbles = merge_boxes(raw_boxes)
 
+    # DEEPL ÇEVİRİ
     deepl_url = "https://api-free.deepl.com/v2/translate" if ":fx" in deepl_key else "https://api.deepl.com/v2/translate"
     deepl_headers = {"Authorization": f"DeepL-Auth-Key {deepl_key}"}
+    
+    final_bubbles = []
+    for idx, bubble in enumerate(bubbles):
+        try:
+            deepl_payload = {'text': bubble['original_text'], 'target_lang': 'TR'}
+            deepl_resp = requests.post(deepl_url, headers=deepl_headers, data=deepl_payload, timeout=20)
+            translated_text = deepl_resp.json()['translations'][0]['text']
+        except:
+            translated_text = bubble['original_text']
+            
+        bubble['id'] = f"bubble_{idx}"
+        bubble['translated_text'] = translated_text
+        final_bubbles.append(bubble)
+
+    # Resmi Geri Döndürme, sadece balonların koordinatlarını ve çevirilerini döndür
+    return jsonify({"status": "success", "bubbles": final_bubbles})
+
+# ==========================================
+# ROTA 2: ÇİZİM YAP (GÜNCEL VERİLERLE RESMİ YAZDIR)
+# ==========================================
+@app.route('/render-manga', methods=['POST'])
+def render_manga():
+    if 'image' not in request.files or 'bubbles' not in request.form:
+        return {"error": "Eksik veri."}, 400
+
+    image_file = request.files['image']
+    bubbles_json = request.form.get('bubbles')
+    
+    try:
+        bubbles = json.loads(bubbles_json)
+        img = Image.open(image_file).convert("RGB")
+    except Exception as e:
+        return {"error": f"Veri veya görsel bozuk: {str(e)}"}, 400
         
+    draw = ImageDraw.Draw(img)
+    
     for bubble in bubbles:
         width = bubble['right'] - bubble['left']
         height = bubble['bottom'] - bubble['top']
-
         pad = 8
+        
         # Beyaz silgi kutusunu çiz
         draw.rounded_rectangle(
             [bubble['left'] - pad, bubble['top'] - pad, bubble['right'] + pad, bubble['bottom'] + pad], 
             radius=12, fill="white"
         )
-
-        try:
-            deepl_payload = {'text': bubble['text'], 'target_lang': 'TR'}
-            deepl_resp = requests.post(deepl_url, headers=deepl_headers, data=deepl_payload, timeout=20)
-            translated_text = deepl_resp.json()['translations'][0]['text']
-        except:
-            translated_text = bubble['text']
-
-        # Dinamik Font ve Metin Kırma İşlemi (Pad değerlerini çıkararak tam iç kutuyu hedef alıyoruz)
+        
+        translated_text = bubble['translated_text']
+        
         inner_max_width = width + (pad * 1.5)
         inner_max_height = height + (pad * 1.5)
         
