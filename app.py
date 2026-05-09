@@ -6,11 +6,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 app = Flask(__name__)
 
-# Font dosyasının konumu
 FONT_PATH = "manga-font.ttf"
 
 def wrap_text(text, font, max_width, draw):
-    """Metni balonun genişliğine göre alt alta böler."""
+    """Metni balonun genişliğine göre akıllıca alt alta böler."""
     words = text.split()
     lines = []
     current_line = ""
@@ -25,111 +24,132 @@ def wrap_text(text, font, max_width, draw):
         lines.append(current_line.strip())
     return "\n".join(lines)
 
+def merge_boxes(boxes, margin=45):
+    """Birbirine yakın olan metin satırlarını tek bir 'Konuşma Balonu' olarak birleştirir."""
+    if not boxes: return []
+    
+    # Yukarıdan aşağıya doğru sırala
+    boxes = sorted(boxes, key=lambda x: x['top'])
+    merged = []
+    
+    for box in boxes:
+        if not merged:
+            merged.append(box)
+            continue
+            
+        last = merged[-1]
+        
+        # Dikey yakınlık ve yatay kesişim kontrolü
+        v_close = (box['top'] - last['bottom']) < margin
+        h_overlap = not (box['left'] > last['right'] or box['right'] < last['left'])
+        
+        if v_close and h_overlap:
+            # Kutuları birleştir (Balonu büyüt)
+            last['text'] += " " + box['text']
+            last['left'] = min(last['left'], box['left'])
+            last['top'] = min(last['top'], box['top'])
+            last['right'] = max(last['right'], box['right'])
+            last['bottom'] = max(last['bottom'], box['bottom'])
+        else:
+            merged.append(box)
+            
+    return merged
+
 @app.route('/process-manga', methods=['POST'])
 def process_manga():
     if 'image' not in request.files:
-        return {"error": "Görsel eksik yollanmış."}, 400
+        return {"error": "Görsel eksik."}, 400
 
     image_file = request.files['image']
     ocr_key = request.form.get('ocr_key')
     deepl_key = request.form.get('deepl_key')
     source_lang = request.form.get('source_lang', 'eng')
 
-    if not ocr_key or not deepl_key:
-        return {"error": "API anahtarları eksik!"}, 400
-
-    # 1. Resmi Pillow ile Aç (Hata verirse yakala)
+    # 1. Pillow ile Görseli Aç
     try:
         img = Image.open(image_file).convert("RGB")
     except Exception as e:
-        return {"error": f"Görsel açılamadı/Bozuk: {str(e)}"}, 400
+        return {"error": f"Görsel bozuk: {str(e)}"}, 400
     
     draw = ImageDraw.Draw(img)
 
-    # 2. OCR.Space WebP Sevmez -> Arka planda JPEG'e çevirip öyle okut!
+    # 2. OCR İçin JPEG'e Çevir
     ocr_io = io.BytesIO()
     img.save(ocr_io, format='JPEG', quality=95)
     ocr_io.seek(0)
 
-    # 3. OCR.Space API'ye Gönder
-    ocr_payload = {
-        'apikey': ocr_key, 
-        'language': source_lang, 
-        'isOverlayRequired': 'true', 
-        'scale': 'true',
-        'OCREngine': '1'
-    }
+    # 3. OCR.Space API İsteği
+    ocr_payload = {'apikey': ocr_key, 'language': source_lang, 'isOverlayRequired': 'true', 'scale': 'true'}
     files = {'file': ('image.jpg', ocr_io.read(), 'image/jpeg')}
     
     try:
         ocr_resp = requests.post('https://api.ocr.space/parse/image', data=ocr_payload, files=files, timeout=40)
         ocr_data = ocr_resp.json()
     except Exception as e:
-        return {"error": f"OCR Servisi Çöktü/Zaman Aşımı: {str(e)}"}, 500
+        return {"error": f"OCR Çöktü: {str(e)}"}, 500
 
-    # OCR API kendi içinde hata verdiyse (Örn: Limit doldu vs.)
-    if ocr_data.get('IsErroredOnProcessing'):
-        error_msg = ocr_data.get('ErrorMessage', ['Bilinmeyen OCR Hatası'])[0]
-        return {"error": f"OCR API Reddedildi: {error_msg}"}, 400
+    if ocr_data.get('IsErroredOnProcessing') or not ocr_data.get('ParsedResults'):
+        return {"error": "OCR görseli okuyamadı."}, 400
 
-    parsed_results = ocr_data.get('ParsedResults', [])
-    if not parsed_results:
-        return {"error": "OCR API görseli okudu ama sonuç döndüremedi."}, 400
-        
-    text_overlay = parsed_results[0].get('TextOverlay')
-    if not text_overlay:
-        return {"error": "Görselde yazılı metin tespit edilemedi (veya okunacak kalitede değil)."}, 400
-
-    lines = text_overlay.get('Lines', [])
+    lines = ocr_data['ParsedResults'][0].get('TextOverlay', {}).get('Lines', [])
     if not lines:
-        return {"error": "Görselde balon içi metin tespit edilemedi."}, 400
+        return {"error": "Görselde metin bulunamadı."}, 400
 
-    # 4. Çeviri ve Pillow ile Çizim İşlemi
+    # Satırların koordinatlarını çıkar
+    raw_boxes = []
+    for line in lines:
+        words = line.get('Words', [])
+        if not words: continue
+        l = min([w['Left'] for w in words])
+        t = min([w['Top'] for w in words])
+        r = max([w['Left'] + w['Width'] for w in words])
+        b = max([w['Top'] + w['Height'] for w in words])
+        raw_boxes.append({'text': line['LineText'], 'left': l, 'top': t, 'right': r, 'bottom': b})
+
+    # Satırları BALONLARA dönüştür (Kümele)
+    bubbles = merge_boxes(raw_boxes)
+
+    # 4. Her Bir Balonu İşle
     deepl_url = "https://api-free.deepl.com/v2/translate" if ":fx" in deepl_key else "https://api.deepl.com/v2/translate"
     deepl_headers = {"Authorization": f"DeepL-Auth-Key {deepl_key}"}
         
-    for line in lines:
-        original_text = line['LineText']
-        
-        # Koordinatları Bul
-        words = line.get('Words', [])
-        if not words: continue
-        
-        left = min([w['Left'] for w in words])
-        top = min([w['Top'] for w in words])
-        right = max([w['Left'] + w['Width'] for w in words])
-        bottom = max([w['Top'] + w['Height'] for w in words])
-        
-        width = right - left
-        height = bottom - top
+    for bubble in bubbles:
+        width = bubble['right'] - bubble['left']
+        height = bubble['bottom'] - bubble['top']
 
-        # Balonun içini beyaza boya (Pillow kalitesiyle)
-        pad = 6 # Taşma payı
-        draw.rectangle([left - pad, top - pad, right + pad, bottom + pad], fill="white")
+        # Zemin Temizleme (Yuvarlatılmış Dikdörtgen ile daha şık bir silgi)
+        pad = 8
+        draw.rounded_rectangle(
+            [bubble['left'] - pad, bubble['top'] - pad, bubble['right'] + pad, bubble['bottom'] + pad], 
+            radius=10, fill="white"
+        )
 
-        # DeepL Çevirisi (Hata yakalamalı)
-        deepl_payload = {'text': original_text, 'target_lang': 'TR'}
+        # DeepL ile Çeviri
         try:
+            deepl_payload = {'text': bubble['text'], 'target_lang': 'TR'}
             deepl_resp = requests.post(deepl_url, headers=deepl_headers, data=deepl_payload, timeout=20)
-            deepl_data = deepl_resp.json()
-            translated_text = deepl_data.get('translations', [{'text': original_text}])[0]['text']
+            translated_text = deepl_resp.json()['translations'][0]['text']
         except:
-            # DeepL çökerse orijinal yazıyı geri bas (beyaz kalmasın)
-            translated_text = original_text
+            translated_text = bubble['text'] # Çeviri çökerse orijinali yaz
 
-        # Metni Yazdırma (Font Büyüklüğünü Kutuya Göre Ayarla)
-        font_size = max(12, int(height / 2)) if height < 40 else 16
+        # Font Boyutunu Balona Göre Dinamik Hesapla
+        font_size = max(14, int(height / 4)) if height > 40 else 14
         try:
             font = ImageFont.truetype(FONT_PATH, font_size)
         except:
             font = ImageFont.load_default()
 
-        wrapped_text = wrap_text(translated_text, font, width + (pad*2), draw)
+        # Metni Kırp ve Hizala
+        wrapped_text = wrap_text(translated_text, font, width + pad, draw)
         
-        # Yazıyı Siyah Renginde Bas
-        draw.multiline_text((left, top), wrapped_text, fill="black", font=font, align="center")
+        # Tam Merkez Koordinatını Bul (Pillow mm anchor özelliği)
+        center_x = bubble['left'] + (width / 2)
+        center_y = bubble['top'] + (height / 2)
+        
+        # Yazıyı kusursuzca ortalayarak bas
+        draw.multiline_text((center_x, center_y), wrapped_text, fill="black", font=font, anchor="mm", align="center")
 
-    # 5. İşlenmiş Görseli Geri Döndür
+    # 5. Sonucu Döndür
     img_io = io.BytesIO()
     img.save(img_io, 'JPEG', quality=95)
     img_io.seek(0)
