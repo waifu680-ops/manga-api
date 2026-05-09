@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import requests
 from flask import Flask, request, send_file
 from PIL import Image, ImageDraw, ImageFont
@@ -25,26 +26,18 @@ def wrap_text(text, font, max_width, draw):
     return "\n".join(lines)
 
 def merge_boxes(boxes, margin=45):
-    """Birbirine yakın olan metin satırlarını tek bir 'Konuşma Balonu' olarak birleştirir."""
+    """Birbirine yakın olan Azure satırlarını tek bir 'Konuşma Balonu' olarak birleştirir."""
     if not boxes: return []
-    
-    # Yukarıdan aşağıya doğru sırala
     boxes = sorted(boxes, key=lambda x: x['top'])
     merged = []
-    
     for box in boxes:
         if not merged:
             merged.append(box)
             continue
-            
         last = merged[-1]
-        
-        # Dikey yakınlık ve yatay kesişim kontrolü
         v_close = (box['top'] - last['bottom']) < margin
         h_overlap = not (box['left'] > last['right'] or box['right'] < last['left'])
-        
         if v_close and h_overlap:
-            # Kutuları birleştir (Balonu büyüt)
             last['text'] += " " + box['text']
             last['left'] = min(last['left'], box['left'])
             last['top'] = min(last['top'], box['top'])
@@ -52,7 +45,6 @@ def merge_boxes(boxes, margin=45):
             last['bottom'] = max(last['bottom'], box['bottom'])
         else:
             merged.append(box)
-            
     return merged
 
 @app.route('/process-manga', methods=['POST'])
@@ -61,9 +53,12 @@ def process_manga():
         return {"error": "Görsel eksik."}, 400
 
     image_file = request.files['image']
-    ocr_key = request.form.get('ocr_key')
+    azure_endpoint = request.form.get('azure_endpoint')
+    azure_key = request.form.get('azure_key')
     deepl_key = request.form.get('deepl_key')
-    source_lang = request.form.get('source_lang', 'eng')
+
+    if not azure_endpoint or not azure_key or not deepl_key:
+        return {"error": "Azure veya DeepL API anahtarları eksik!"}, 400
 
     # 1. Pillow ile Görseli Aç
     try:
@@ -73,43 +68,65 @@ def process_manga():
     
     draw = ImageDraw.Draw(img)
 
-    # 2. OCR İçin JPEG'e Çevir
-    ocr_io = io.BytesIO()
-    img.save(ocr_io, format='JPEG', quality=95)
-    ocr_io.seek(0)
+    # 2. Azure İçin Resmi Byte Formatına Çevir
+    img_io = io.BytesIO()
+    img.save(img_io, format='JPEG', quality=95)
+    img_bytes = img_io.getvalue()
 
-    # 3. OCR.Space API İsteği
-    ocr_payload = {'apikey': ocr_key, 'language': source_lang, 'isOverlayRequired': 'true', 'scale': 'true'}
-    files = {'file': ('image.jpg', ocr_io.read(), 'image/jpeg')}
+    # 3. Azure Computer Vision (Read API) İstekleri
+    # Azure Read API asenkrondur, önce işi yollarız, sonra sonucunu bekleriz (Polling)
+    endpoint_url = azure_endpoint.rstrip('/') + "/vision/v3.2/read/analyze"
+    headers = {
+        'Ocp-Apim-Subscription-Key': azure_key,
+        'Content-Type': 'application/octet-stream'
+    }
     
     try:
-        ocr_resp = requests.post('https://api.ocr.space/parse/image', data=ocr_payload, files=files, timeout=40)
-        ocr_data = ocr_resp.json()
+        # İşi Azure'a yolla
+        analyze_resp = requests.post(endpoint_url, headers=headers, data=img_bytes, timeout=30)
+        analyze_resp.raise_for_status()
+        operation_url = analyze_resp.headers["Operation-Location"]
+        
+        # Sonucu bekle (Ortalama 1-2 saniye sürer)
+        poll_headers = {'Ocp-Apim-Subscription-Key': azure_key}
+        status = ""
+        while status not in ["succeeded", "failed"]:
+            time.sleep(1)
+            poll_resp = requests.get(operation_url, headers=poll_headers)
+            poll_data = poll_resp.json()
+            status = poll_data.get("status")
+        
+        if status == "failed":
+            return {"error": "Azure OCR işlemi başarısız oldu."}, 400
+
     except Exception as e:
-        return {"error": f"OCR Çöktü: {str(e)}"}, 500
+        return {"error": f"Azure API Hatası: {str(e)}"}, 500
 
-    if ocr_data.get('IsErroredOnProcessing') or not ocr_data.get('ParsedResults'):
-        return {"error": "OCR görseli okuyamadı."}, 400
+    # 4. Azure'dan Dönen Verileri İşle
+    analyze_result = poll_data.get("analyzeResult", {}).get("readResults", [])
+    if not analyze_result:
+        return {"error": "Azure sonuç döndürmedi."}, 400
 
-    lines = ocr_data['ParsedResults'][0].get('TextOverlay', {}).get('Lines', [])
+    lines = analyze_result[0].get("lines", [])
     if not lines:
         return {"error": "Görselde metin bulunamadı."}, 400
 
-    # Satırların koordinatlarını çıkar
     raw_boxes = []
     for line in lines:
-        words = line.get('Words', [])
-        if not words: continue
-        l = min([w['Left'] for w in words])
-        t = min([w['Top'] for w in words])
-        r = max([w['Left'] + w['Width'] for w in words])
-        b = max([w['Top'] + w['Height'] for w in words])
-        raw_boxes.append({'text': line['LineText'], 'left': l, 'top': t, 'right': r, 'bottom': b})
+        text = line.get("text", "")
+        box = line.get("boundingBox", []) # Azure 8 nokta verir: [x1, y1, x2, y2, x3, y3, x4, y4]
+        if not text or len(box) != 8: continue
+            
+        # 8 noktalı Azure kutusunu standart Pillow Kutusuna (sol, üst, sağ, alt) çevir
+        l = min(box[0], box[2], box[4], box[6])
+        t = min(box[1], box[3], box[5], box[7])
+        r = max(box[0], box[2], box[4], box[6])
+        b = max(box[1], box[3], box[5], box[7])
+        raw_boxes.append({'text': text, 'left': l, 'top': t, 'right': r, 'bottom': b})
 
-    # Satırları BALONLARA dönüştür (Kümele)
     bubbles = merge_boxes(raw_boxes)
 
-    # 4. Her Bir Balonu İşle
+    # 5. Her Bir Balonu Çevir ve Yaz
     deepl_url = "https://api-free.deepl.com/v2/translate" if ":fx" in deepl_key else "https://api.deepl.com/v2/translate"
     deepl_headers = {"Authorization": f"DeepL-Auth-Key {deepl_key}"}
         
@@ -117,44 +134,38 @@ def process_manga():
         width = bubble['right'] - bubble['left']
         height = bubble['bottom'] - bubble['top']
 
-        # Zemin Temizleme (Yuvarlatılmış Dikdörtgen ile daha şık bir silgi)
         pad = 8
         draw.rounded_rectangle(
             [bubble['left'] - pad, bubble['top'] - pad, bubble['right'] + pad, bubble['bottom'] + pad], 
             radius=10, fill="white"
         )
 
-        # DeepL ile Çeviri
         try:
             deepl_payload = {'text': bubble['text'], 'target_lang': 'TR'}
             deepl_resp = requests.post(deepl_url, headers=deepl_headers, data=deepl_payload, timeout=20)
             translated_text = deepl_resp.json()['translations'][0]['text']
         except:
-            translated_text = bubble['text'] # Çeviri çökerse orijinali yaz
+            translated_text = bubble['text']
 
-        # Font Boyutunu Balona Göre Dinamik Hesapla
         font_size = max(14, int(height / 4)) if height > 40 else 14
         try:
             font = ImageFont.truetype(FONT_PATH, font_size)
         except:
             font = ImageFont.load_default()
 
-        # Metni Kırp ve Hizala
         wrapped_text = wrap_text(translated_text, font, width + pad, draw)
         
-        # Tam Merkez Koordinatını Bul (Pillow mm anchor özelliği)
         center_x = bubble['left'] + (width / 2)
         center_y = bubble['top'] + (height / 2)
         
-        # Yazıyı kusursuzca ortalayarak bas
         draw.multiline_text((center_x, center_y), wrapped_text, fill="black", font=font, anchor="mm", align="center")
 
-    # 5. Sonucu Döndür
-    img_io = io.BytesIO()
-    img.save(img_io, 'JPEG', quality=95)
-    img_io.seek(0)
+    # 6. Sonucu Döndür
+    final_io = io.BytesIO()
+    img.save(final_io, 'JPEG', quality=95)
+    final_io.seek(0)
     
-    return send_file(img_io, mimetype='image/jpeg')
+    return send_file(final_io, mimetype='image/jpeg')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
